@@ -61,6 +61,6 @@ jobs:
 
       - name: Run Elastic Vale Linter
         if: steps.select-files.outputs.has_files == 'true'
-        uses: ./.github/vale-sink
+        uses: alonesusvictim/vale-crossing-action@v1
         with:
           files: ${{ steps.select-files.outputs.files }}
