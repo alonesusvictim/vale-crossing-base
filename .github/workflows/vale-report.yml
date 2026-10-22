@@ -1,0 +1,120 @@
+# Lab reproduction of elastic/integrations .github/workflows/vale-report.yml
+# plus the steps of elastic/docs-actions vale/report/action.yml inlined, so the
+# guards can be seen in one file. render_report.py is Elastic's, byte for byte.
+
+name: Vale Report
+
+on:
+  workflow_run:
+    workflows: ["Vale Lint"]
+    types:
+      - completed
+
+permissions:
+  pull-requests: write
+
+jobs:
+  report:
+    name: Post Results
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    steps:
+      - name: Checkout base (for Elastic's renderer)
+        uses: actions/checkout@v7
+
+      - name: Check for Vale results artifact
+        id: check-artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          count=$(gh api \
+            "repos/${{ github.repository }}/actions/runs/${LINT_RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name == "vale-results")] | length')
+          echo "exists=$([ "$count" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Download Vale results
+        if: steps.check-artifact.outputs.exists == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: vale-results
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: .vale-artifacts
+
+      - name: Check for unexpected files in artifact
+        if: steps.check-artifact.outputs.exists == 'true'
+        working-directory: .vale-artifacts
+        run: |
+          unexpected=""
+          for f in *; do
+            case "$f" in
+              vale_results.json|vale_report.md|issue_counts.txt) ;;
+              *) unexpected="$unexpected $f" ;;
+            esac
+          done
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unexpected files in artifact directory:$unexpected"
+            exit 1
+          fi
+          echo "artifact file list accepted:"; ls -la
+
+      - name: Detect result format
+        id: check-results
+        if: steps.check-artifact.outputs.exists == 'true'
+        run: |
+          if [ -f .vale-artifacts/vale_results.json ]; then
+            echo "format=json" >> $GITHUB_OUTPUT
+            echo "has_results=true" >> $GITHUB_OUTPUT
+          elif [ -f .vale-artifacts/vale_report.md ]; then
+            echo "format=legacy" >> $GITHUB_OUTPUT
+            echo "has_results=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_results=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get PR number
+        id: pr-number
+        if: steps.check-artifact.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUESTS_JSON: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          PR_NUMBER=$(echo "$PULL_REQUESTS_JSON" | jq -r '.[0].number')
+          if [ "$PR_NUMBER" == "null" ] || [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER=$(gh pr list --repo "$GH_REPO" --state open --json number,headRefOid \
+              --jq ".[] | select(.headRefOid == \"$HEAD_SHA\") | .number" | head -1)
+          fi
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "PR number: $PR_NUMBER"
+
+      - name: Validate and render report
+        if: steps.check-results.outputs.format == 'json'
+        env:
+          STEPS_PR_NUMBER_OUTPUTS_PR_NUMBER: ${{ steps.pr-number.outputs.pr_number }}
+        run: |
+          echo "--- artifact contents as received ---"
+          cat .vale-artifacts/vale_results.json
+          echo
+          echo "--- running Elastic's render_report.py, byte for byte ---"
+          python3 .github/render_report.py \
+            --input .vale-artifacts/vale_results.json \
+            --output .vale-artifacts/vale_report.md \
+            --repo "${{ github.repository }}" \
+            --pr "${STEPS_PR_NUMBER_OUTPUTS_PR_NUMBER}"
+          echo "--- rendered comment body ---"
+          cat .vale-artifacts/vale_report.md
+
+      - name: Post sticky comment
+        if: steps.check-results.outputs.has_results == 'true' && steps.pr-number.outputs.pr_number != 'null'
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: elastic-vale-results
+          skip_unchanged: true
+          path: .vale-artifacts/vale_report.md
+          number: ${{ steps.pr-number.outputs.pr_number }}
+          GITHUB_TOKEN: ${{ github.token }}
